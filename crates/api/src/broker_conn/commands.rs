@@ -91,9 +91,7 @@ async fn redis_broadcast_control(
 ) -> Result<(), String> {
     let client = connect_redis(connection_url).await?;
 
-    // Parse DB number from URL for the pidbox channel
-    let db = parse_redis_db(connection_url);
-    let channel = format!("/{db}/celery.pidbox");
+    let channel = redis_pidbox_channel(parse_redis_db(connection_url));
 
     let control_msg = serde_json::json!({
         "method": method,
@@ -103,13 +101,50 @@ async fn redis_broadcast_control(
         "matcher": null,
     });
 
-    let msg = serde_json::to_string(&control_msg).map_err(|e| e.to_string())?;
+    let envelope = redis_control_envelope(&control_msg, &Uuid::new_v4().to_string())?;
+    let msg = serde_json::to_string(&envelope).map_err(|e| e.to_string())?;
     client
         .publish::<(), _, _>(channel.as_str(), msg.as_str())
         .await
         .map_err(|e| format!("Failed to PUBLISH control command: {e}"))?;
 
     Ok(())
+}
+
+/// Pub/sub channel Kombu's Redis transport uses for the `celery.pidbox`
+/// fanout exchange: `keyprefix_fanout` (`/{db}.`) followed by the exchange name.
+fn redis_pidbox_channel(db: u32) -> String {
+    format!("/{db}.celery.pidbox")
+}
+
+/// Wrap a pidbox control message in the Kombu envelope the worker's Redis
+/// transport expects on fanout channels (it reads `properties.delivery_tag`
+/// and decodes the body per `properties.body_encoding`).
+fn redis_control_envelope(
+    control_msg: &serde_json::Value,
+    delivery_tag: &str,
+) -> Result<serde_json::Value, String> {
+    let body_json = serde_json::to_string(control_msg).map_err(|e| e.to_string())?;
+    let body_str = base64::engine::general_purpose::STANDARD.encode(body_json.as_bytes());
+
+    Ok(serde_json::json!({
+        "body": body_str,
+        "content-encoding": "utf-8",
+        "content-type": "application/json",
+        "headers": {
+            "clock": 0,
+            "expires": 0,
+        },
+        "properties": {
+            "delivery_info": {
+                "exchange": "celery.pidbox",
+                "routing_key": "",
+            },
+            "priority": 0,
+            "body_encoding": "base64",
+            "delivery_tag": delivery_tag,
+        }
+    }))
 }
 
 /// Revoke a task via Redis pidbox broadcast.
@@ -536,5 +571,28 @@ mod tests {
     fn parse_redis_db_with_params() {
         // When there's a query string, the "db" portion won't parse as u8
         assert_eq!(parse_redis_db("redis://localhost:6379/0?timeout=5"), 0);
+    }
+
+    #[test]
+    fn redis_pidbox_channel_matches_kombu_fanout_topic() {
+        assert_eq!(redis_pidbox_channel(0), "/0.celery.pidbox");
+        assert_eq!(redis_pidbox_channel(3), "/3.celery.pidbox");
+    }
+
+    #[test]
+    fn redis_control_envelope_round_trips() {
+        let control_msg = serde_json::json!({
+            "method": "revoke",
+            "arguments": {"task_id": "abc", "terminate": false, "signal": "SIGQUIT"},
+            "destination": null,
+            "pattern": null,
+            "matcher": null,
+        });
+        let envelope = redis_control_envelope(&control_msg, "tag-1").unwrap();
+
+        assert_eq!(envelope["properties"]["delivery_tag"], "tag-1");
+        assert_eq!(envelope["properties"]["delivery_info"]["exchange"], "celery.pidbox");
+        let raw = serde_json::to_string(&envelope).unwrap();
+        assert_eq!(crate::broker_conn::kombu::decode_kombu_body(&raw).unwrap(), control_msg);
     }
 }
