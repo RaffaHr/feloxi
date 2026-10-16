@@ -239,7 +239,7 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-use super::commands::parse_redis_db;
+use super::commands::{binding_member_queue, parse_redis_db};
 
 async fn flush_batches(
     state: &AppState,
@@ -433,10 +433,8 @@ async fn discover_celery_queues(client: &Pool) -> Vec<String> {
 
     let mut queues = Vec::new();
     for member in &members {
-        if let Some(queue_name) = member.split('\t').next() {
-            if !queue_name.is_empty() {
-                queues.push(queue_name.to_string());
-            }
+        if let Some(queue_name) = binding_member_queue(member) {
+            queues.push(queue_name.to_string());
         }
     }
 

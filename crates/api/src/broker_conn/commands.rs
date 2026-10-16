@@ -175,10 +175,10 @@ pub async fn redis_shutdown_worker(connection_url: &str, hostname: &str) -> Resu
 
 /// Get queue depths from a Redis broker.
 ///
-/// Celery + Kombu register each queue under a set at `_kombu.binding.<exchange>`.
-/// We SCAN for all of those keys, strip the prefix to derive the queue name,
-/// and drop the well-known internal bindings (event bus, pidbox, replies) that
-/// shouldn't surface in the task-queue list.
+/// Celery + Kombu register each queue binding in a set at
+/// `_kombu.binding.<exchange>`. We SCAN for all of those keys, drop the
+/// well-known internal exchanges (event bus, pidbox, replies) that shouldn't
+/// surface in the task-queue list, and read the queue names from the members.
 pub async fn redis_queue_stats(connection_url: &str) -> Result<Vec<QueueInfo>, String> {
     use futures::StreamExt;
 
@@ -186,16 +186,23 @@ pub async fn redis_queue_stats(connection_url: &str) -> Result<Vec<QueueInfo>, S
 
     let client = connect_redis(connection_url).await?;
 
-    let mut queue_names: Vec<String> = Vec::new();
+    let mut binding_keys: Vec<String> = Vec::new();
     let mut stream = client.scan_buffered(format!("{BINDING_PREFIX}*"), Some(200), None);
     while let Some(item) = stream.next().await {
         let Ok(key) = item else { continue };
         let key_str = key.as_str_lossy();
-        if let Some(name) = key_str.strip_prefix(BINDING_PREFIX) {
-            if !is_internal_binding(name) {
-                queue_names.push(name.to_string());
+        if let Some(exchange) = key_str.strip_prefix(BINDING_PREFIX) {
+            if !is_internal_binding(exchange) {
+                binding_keys.push(key_str.to_string());
             }
         }
+    }
+
+    let mut queue_names: Vec<String> = Vec::new();
+    for key in &binding_keys {
+        let members: Vec<String> = client.smembers(key.as_str()).await.unwrap_or_default();
+        queue_names
+            .extend(members.iter().filter_map(|m| binding_member_queue(m)).map(String::from));
     }
 
     queue_names.sort();
@@ -214,6 +221,12 @@ pub async fn redis_queue_stats(connection_url: &str) -> Result<Vec<QueueInfo>, S
 /// rather than user-visible task queues.
 fn is_internal_binding(name: &str) -> bool {
     name == "celeryev" || name.ends_with(".pidbox") || name.starts_with("reply.")
+}
+
+/// Queue name from a `_kombu.binding.<exchange>` set member, which Kombu
+/// stores as `routing_key`, `pattern` and `queue` joined by `\x06\x16`.
+pub(crate) fn binding_member_queue(member: &str) -> Option<&str> {
+    member.split("\x06\x16").nth(2).filter(|q| !q.is_empty())
 }
 
 // ─── AMQP Commands ───────────────────────────────────────────────────────────
@@ -571,6 +584,23 @@ mod tests {
     fn parse_redis_db_with_params() {
         // When there's a query string, the "db" portion won't parse as u8
         assert_eq!(parse_redis_db("redis://localhost:6379/0?timeout=5"), 0);
+    }
+
+    #[test]
+    fn binding_member_queue_reads_queue_field() {
+        // Members are routing_key, pattern and queue; the queue need not match the routing key
+        assert_eq!(binding_member_queue("email.welcome\x06\x16\x06\x16emails"), Some("emails"));
+        assert_eq!(
+            binding_member_queue("worker.#\x06\x16\x06\x16celeryev.1234"),
+            Some("celeryev.1234")
+        );
+    }
+
+    #[test]
+    fn binding_member_queue_rejects_malformed_members() {
+        // A bare name (no separators) or an empty queue field yields no queue
+        assert_eq!(binding_member_queue("emails"), None);
+        assert_eq!(binding_member_queue("default\x06\x16\x06\x16"), None);
     }
 
     #[test]
