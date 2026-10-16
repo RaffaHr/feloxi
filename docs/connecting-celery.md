@@ -120,6 +120,27 @@ curl -X POST http://localhost:8080/api/v1/brokers \
 The response includes the broker `id`. You can use it later to start/stop the
 connection or retrieve per-broker stats.
 
+### Redis key prefix (`global_keyprefix`)
+
+If your Celery app sets Kombu's `global_keyprefix` transport option, Kombu
+prepends it to every Redis key and pub/sub channel it uses:
+
+```python
+broker_transport_options = {"global_keyprefix": "myapp."}
+```
+
+Add the same prefix to the broker URL in Feloxi as a query parameter so it
+looks in the same place:
+
+```
+redis://your-redis-host:6379/0?global_keyprefix=myapp.
+```
+
+The value must match `global_keyprefix` exactly, including any trailing `.` or
+`:`. Feloxi removes the parameter before connecting and applies the prefix to
+event channels, queue keys and control commands. Without it, Feloxi connects
+fine but sees no events or queue depths.
+
 ---
 
 ## What happens after you connect

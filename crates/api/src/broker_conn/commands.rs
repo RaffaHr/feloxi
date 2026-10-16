@@ -30,7 +30,7 @@ pub async fn redis_publish_task(
     parent_id: Option<&str>,
     root_id: Option<&str>,
 ) -> Result<(), String> {
-    let client = connect_redis(connection_url).await?;
+    let (client, broker) = connect_redis(connection_url).await?;
 
     let effective_root = root_id.unwrap_or(task_id);
 
@@ -75,7 +75,7 @@ pub async fn redis_publish_task(
 
     let msg = serde_json::to_string(&envelope).map_err(|e| e.to_string())?;
     client
-        .lpush::<(), _, _>(queue, msg.as_str())
+        .lpush::<(), _, _>(broker.key(queue), msg.as_str())
         .await
         .map_err(|e| format!("Failed to LPUSH task: {e}"))?;
 
@@ -89,9 +89,9 @@ async fn redis_broadcast_control(
     arguments: serde_json::Value,
     destination: Option<&[&str]>,
 ) -> Result<(), String> {
-    let client = connect_redis(connection_url).await?;
+    let (client, broker) = connect_redis(connection_url).await?;
 
-    let channel = redis_pidbox_channel(parse_redis_db(connection_url));
+    let channel = broker.key(&redis_pidbox_channel(parse_redis_db(&broker.url)));
 
     let control_msg = serde_json::json!({
         "method": method,
@@ -184,14 +184,15 @@ pub async fn redis_queue_stats(connection_url: &str) -> Result<Vec<QueueInfo>, S
 
     const BINDING_PREFIX: &str = "_kombu.binding.";
 
-    let client = connect_redis(connection_url).await?;
+    let (client, broker) = connect_redis(connection_url).await?;
+    let binding_prefix = broker.key(BINDING_PREFIX);
 
     let mut binding_keys: Vec<String> = Vec::new();
-    let mut stream = client.scan_buffered(format!("{BINDING_PREFIX}*"), Some(200), None);
+    let mut stream = client.scan_buffered(format!("{binding_prefix}*"), Some(200), None);
     while let Some(item) = stream.next().await {
         let Ok(key) = item else { continue };
         let key_str = key.as_str_lossy();
-        if let Some(exchange) = key_str.strip_prefix(BINDING_PREFIX) {
+        if let Some(exchange) = key_str.strip_prefix(binding_prefix.as_str()) {
             if !is_internal_binding(exchange) {
                 binding_keys.push(key_str.to_string());
             }
@@ -210,7 +211,7 @@ pub async fn redis_queue_stats(connection_url: &str) -> Result<Vec<QueueInfo>, S
 
     let mut stats = Vec::with_capacity(queue_names.len());
     for name in &queue_names {
-        let depth: u64 = client.llen::<u64, _>(name.as_str()).await.unwrap_or(0);
+        let depth: u64 = client.llen::<u64, _>(broker.key(name)).await.unwrap_or(0);
         stats.push(QueueInfo { queue_name: name.clone(), depth });
     }
 
@@ -507,9 +508,10 @@ pub async fn purge_queue(
 }
 
 async fn redis_purge_queue(connection_url: &str, queue_name: &str) -> Result<u64, String> {
-    let client = connect_redis(connection_url).await?;
-    let count: u64 = client.llen(queue_name).await.unwrap_or(0);
-    client.del::<(), _>(queue_name).await.map_err(|e| format!("Failed to DEL queue: {e}"))?;
+    let (client, broker) = connect_redis(connection_url).await?;
+    let key = broker.key(queue_name);
+    let count: u64 = client.llen(&key).await.unwrap_or(0);
+    client.del::<(), _>(&key).await.map_err(|e| format!("Failed to DEL queue: {e}"))?;
     Ok(count)
 }
 
@@ -528,8 +530,10 @@ async fn amqp_purge_queue(connection_url: &str, queue_name: &str) -> Result<u64,
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-async fn connect_redis(url: &str) -> Result<Client, String> {
-    let config = Config::from_url(url).map_err(|e| redact(format!("Invalid Redis URL: {e}")))?;
+async fn connect_redis(url: &str) -> Result<(Client, RedisBrokerUrl), String> {
+    let broker = RedisBrokerUrl::parse(url);
+    let config =
+        Config::from_url(&broker.url).map_err(|e| redact(format!("Invalid Redis URL: {e}")))?;
     let mut builder = Builder::from_config(config);
     builder.set_policy(ReconnectPolicy::new_constant(0, 3000));
     let client =
@@ -540,7 +544,7 @@ async fn connect_redis(url: &str) -> Result<Client, String> {
         .map_err(|_| "Redis connection timed out".to_string())?
         .map_err(|e| redact(format!("Failed to connect to Redis: {e}")))?;
 
-    Ok(client)
+    Ok((client, broker))
 }
 
 async fn connect_amqp(url: &str) -> Result<lapin::Connection, String> {
@@ -565,6 +569,47 @@ pub(crate) fn parse_redis_db(url: &str) -> u32 {
         .unwrap_or(0)
 }
 
+/// A Redis broker URL split into the part fred understands and Kombu's
+/// `global_keyprefix` transport option, which Feloxi reads from the URL query
+/// (`redis://host:6379/0?global_keyprefix=myapp.`). Kombu prepends the prefix
+/// to every key and pub/sub channel it uses, so Feloxi has to as well.
+pub(crate) struct RedisBrokerUrl {
+    /// The URL with `global_keyprefix` removed.
+    pub url: String,
+    /// The key prefix, empty when not set.
+    pub prefix: String,
+}
+
+impl RedisBrokerUrl {
+    pub fn parse(raw: &str) -> Self {
+        const PARAM: &str = "global_keyprefix";
+
+        let Some((base, query)) = raw.split_once('?') else {
+            return Self { url: raw.to_string(), prefix: String::new() };
+        };
+
+        let mut prefix = String::new();
+        let mut kept: Vec<&str> = Vec::new();
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            if key == PARAM {
+                prefix = value.to_string();
+            } else {
+                kept.push(pair);
+            }
+        }
+
+        let url =
+            if kept.is_empty() { base.to_string() } else { format!("{base}?{}", kept.join("&")) };
+        Self { url, prefix }
+    }
+
+    /// The Redis key (or channel) Kombu uses for `name`.
+    pub fn key(&self, name: &str) -> String {
+        format!("{}{name}", self.prefix)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -584,6 +629,52 @@ mod tests {
     fn parse_redis_db_with_params() {
         // When there's a query string, the "db" portion won't parse as u8
         assert_eq!(parse_redis_db("redis://localhost:6379/0?timeout=5"), 0);
+    }
+
+    #[test]
+    fn redis_broker_url_without_prefix_is_unchanged() {
+        // No global_keyprefix: the URL passes through as-is and keys are unprefixed
+        for raw in ["redis://localhost:6379/0", "redis://:pw@localhost:6379/1?timeout=5"] {
+            let broker = RedisBrokerUrl::parse(raw);
+            assert_eq!(broker.url, raw);
+            assert_eq!(broker.prefix, "");
+            assert_eq!(broker.key("emails"), "emails");
+        }
+    }
+
+    #[test]
+    fn redis_broker_url_strips_prefix() {
+        // The option is removed so fred and parse_redis_db only see the plain URL
+        let broker = RedisBrokerUrl::parse("redis://localhost:6379/2?global_keyprefix=myapp.");
+        assert_eq!(broker.url, "redis://localhost:6379/2");
+        assert_eq!(broker.prefix, "myapp.");
+        assert_eq!(parse_redis_db(&broker.url), 2);
+    }
+
+    #[test]
+    fn redis_broker_url_keeps_other_params() {
+        // Other query params survive in their original order
+        let broker =
+            RedisBrokerUrl::parse("redis://localhost:6379/0?timeout=5&global_keyprefix=myapp:&a=b");
+        assert_eq!(broker.url, "redis://localhost:6379/0?timeout=5&a=b");
+        assert_eq!(broker.prefix, "myapp:");
+    }
+
+    #[test]
+    fn redis_broker_url_empty_prefix_behaves_like_none() {
+        // An empty value is stripped and leaves keys unprefixed
+        let broker = RedisBrokerUrl::parse("redis://localhost:6379/0?global_keyprefix=");
+        assert_eq!(broker.url, "redis://localhost:6379/0");
+        assert_eq!(broker.key("emails"), "emails");
+    }
+
+    #[test]
+    fn redis_broker_url_prefixes_keys_and_channels() {
+        // Kombu prepends the prefix to list keys, binding keys and pub/sub channels alike
+        let broker = RedisBrokerUrl::parse("redis://localhost:6379/0?global_keyprefix=myapp.");
+        assert_eq!(broker.key("emails"), "myapp.emails");
+        assert_eq!(broker.key("_kombu.binding.celeryev"), "myapp._kombu.binding.celeryev");
+        assert_eq!(broker.key(&redis_pidbox_channel(0)), "myapp./0.celery.pidbox");
     }
 
     #[test]

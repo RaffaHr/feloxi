@@ -17,7 +17,8 @@ pub async fn run_redis_consumer(
 ) {
     tracing::info!(%tenant_id, %config_id, "Starting Redis broker consumer");
 
-    let redis_config = match Config::from_url(&broker_url) {
+    let broker = RedisBrokerUrl::parse(&broker_url);
+    let redis_config = match Config::from_url(&broker.url) {
         Ok(c) => c,
         Err(e) => {
             let err = common::redact::redact_url_credentials(&format!("Invalid Redis URL: {e}"));
@@ -110,9 +111,9 @@ pub async fn run_redis_consumer(
 
     let _manage_handle = subscriber.manage_subscriptions();
 
-    let db_number = parse_redis_db(&broker_url);
-    let pattern_with_db = format!("/{db_number}.celeryev/*");
-    let pattern_plain = "/celeryev/*".to_string();
+    let db_number = parse_redis_db(&broker.url);
+    let pattern_with_db = broker.key(&format!("/{db_number}.celeryev/*"));
+    let pattern_plain = broker.key("/celeryev/*");
 
     if let Err(e) =
         subscriber.psubscribe::<Vec<String>>(vec![pattern_with_db.clone(), pattern_plain]).await
@@ -199,7 +200,7 @@ pub async fn run_redis_consumer(
                 ).await;
 
                 if last_drain.elapsed() >= Duration::from_secs(drain_secs) {
-                    drain_list_queues(&client, &mut task_batch, &mut worker_batch, drain_max).await;
+                    drain_list_queues(&client, &broker, &mut task_batch, &mut worker_batch, drain_max).await;
                     last_drain = tokio::time::Instant::now();
                 }
 
@@ -239,7 +240,7 @@ fn env_or<T: std::str::FromStr>(name: &str, default: T) -> T {
     std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-use super::commands::{binding_member_queue, parse_redis_db};
+use super::commands::{binding_member_queue, parse_redis_db, RedisBrokerUrl};
 
 async fn flush_batches(
     state: &AppState,
@@ -394,11 +395,12 @@ fn parse_raw_message(raw_msg: &str) -> Option<ParsedEvent> {
 
 async fn drain_list_queues(
     client: &Pool,
+    broker: &RedisBrokerUrl,
     task_batch: &mut Vec<common::RawTaskEvent>,
     worker_batch: &mut Vec<common::RawWorkerEvent>,
     max_drain: usize,
 ) {
-    let queues = discover_celery_queues(client).await;
+    let queues = discover_celery_queues(client, broker).await;
     if queues.is_empty() {
         return;
     }
@@ -406,7 +408,7 @@ async fn drain_list_queues(
     let mut drained = 0;
     for key in &queues {
         while drained < max_drain {
-            let result: Result<Option<String>, _> = client.rpop(key.as_str(), None).await;
+            let result: Result<Option<String>, _> = client.rpop(broker.key(key), None).await;
             match result {
                 Ok(Some(raw_msg)) => {
                     if let Some(parsed) = parse_raw_message(&raw_msg) {
@@ -423,10 +425,10 @@ async fn drain_list_queues(
     }
 }
 
-async fn discover_celery_queues(client: &Pool) -> Vec<String> {
-    let binding_key = "_kombu.binding.celeryev";
+async fn discover_celery_queues(client: &Pool, broker: &RedisBrokerUrl) -> Vec<String> {
+    let binding_key = broker.key("_kombu.binding.celeryev");
 
-    let members: Vec<String> = match client.smembers(binding_key).await {
+    let members: Vec<String> = match client.smembers(&binding_key).await {
         Ok(m) => m,
         Err(_) => return vec![],
     };
@@ -448,7 +450,7 @@ async fn discover_celery_queues(client: &Pool) -> Vec<String> {
 }
 
 pub async fn test_redis_connection(url: &str) -> Result<(), String> {
-    let config = Config::from_url(url)
+    let config = Config::from_url(&RedisBrokerUrl::parse(url).url)
         .map_err(|e| common::redact::redact_url_credentials(&format!("Invalid Redis URL: {e}")))?;
     let mut builder = Builder::from_config(config);
     builder.set_policy(ReconnectPolicy::new_constant(0, 3000));
