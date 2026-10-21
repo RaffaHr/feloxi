@@ -3,6 +3,7 @@ name: Security
 on:
   push:
     branches: [main]
+  pull_request:
   schedule:
     - cron: '0 6 * * 1'
 
@@ -18,6 +19,7 @@ jobs:
           exit-code: '1'
 
   gitleaks:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
