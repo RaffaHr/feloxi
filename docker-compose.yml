@@ -38,7 +38,7 @@ services:
       dockerfile: deploy/docker/Dockerfile.web
     container_name: feloxi-web
     ports:
-      - "3000:3000"
+      - "${WEB_PORT}:3000"
     environment:
       - NODE_ENV=production
       - API_URL=http://api:8080
