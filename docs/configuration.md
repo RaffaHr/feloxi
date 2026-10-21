@@ -6,7 +6,7 @@ All Feloxi configuration is done through environment variables. Copy `.env.examp
 
 | Variable         | Required | Default                       | Description                                                                                                                           |
 | ---------------- | -------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
-| `DATABASE_URL`   | Yes      | —                             | PostgreSQL connection string. Example: `postgres://fp:feloxi@localhost:5432/feloxi`                                                   |
+| `DATABASE_URL`   | Yes      | —                             | PostgreSQL connection string. Example: `postgres://fp:feloxi@localhost:5432/feloxi`. For TLS, append `?sslmode=verify-full` (`sslrootcert=system` isn't supported). |
 | `CLICKHOUSE_URL` | Yes      | `http://localhost:8123`       | ClickHouse HTTP endpoint                                                                                                              |
 | `REDIS_URL`      | Yes      | `redis://localhost:6379`      | Redis connection string                                                                                                               |
 | `JWT_SECRET`     | Yes      | —                             | Secret key for signing JWT tokens. Use at least 32 random characters in production                                                    |
