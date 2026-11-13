@@ -31,6 +31,7 @@ services:
       start_period: 30s
     networks:
       - feloxi
+      - hiperzao_amqp_shared
 
   web:
     build:
@@ -133,3 +134,9 @@ volumes:
 networks:
   feloxi:
     driver: bridge
+  # Rede criada pelo compose do hiperzao (T-092): so o RabbitMQ dele esta nela, com o alias
+  # hiperzao-rabbitmq. Suba o hiperzao antes do feloxi; sem a rede, este compose nao sobe.
+  # Broker no feloxi: amqp://<usuario-feloxi>:<senha>@hiperzao-rabbitmq:5672/%2F
+  hiperzao_amqp_shared:
+    external: true
+    name: hiperzao_amqp_shared
